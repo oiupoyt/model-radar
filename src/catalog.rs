@@ -15,8 +15,34 @@ pub struct Model {
     pub description: String,
     #[serde(default)]
     pub context_length: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_pricing")]
     pub pricing: BTreeMap<String, String>,
+}
+
+fn deserialize_pricing<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(key, value)| {
+            if key == "overrides" && value.is_array() {
+                let empty = value.as_array().is_some_and(Vec::is_empty);
+                return Ok((
+                    key,
+                    if empty {
+                        "0".into()
+                    } else {
+                        "tiered pricing".into()
+                    },
+                ));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                serde::de::Error::custom("expected a pricing string or overrides array")
+            })?;
+            Ok((key, value.to_owned()))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -285,6 +311,18 @@ mod tests {
         ] {
             assert!(parse_catalog(body.as_bytes()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn tiered_pricing_is_accepted_but_not_assumed_free() {
+        let body = br#"{"data":[{"id":"a","name":"A","pricing":{"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":100,"prompt":"1"}]}}]}"#;
+        let catalog = parse_catalog(body).unwrap();
+        assert!(!catalog["a"].is_free());
+        let saved = serde_json::to_vec(&catalog["a"]).unwrap();
+        let restored: Model = serde_json::from_slice(&saved).unwrap();
+        assert!(!restored.is_free());
+        let body = br#"{"data":[{"id":"a","name":"A","pricing":{"prompt":"0","completion":"0","overrides":[]}}]}"#;
+        assert!(parse_catalog(body).unwrap()["a"].is_free());
     }
 
     #[test]
