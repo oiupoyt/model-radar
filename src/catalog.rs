@@ -7,7 +7,7 @@ use crate::Error;
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/models";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     pub name: String,
@@ -45,7 +45,7 @@ where
         .collect()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub model: Model,
     pub kind: String,
@@ -96,7 +96,7 @@ impl Model {
     }
 }
 
-fn validate(catalog: &BTreeMap<String, Model>) -> Result<(), Error> {
+pub(crate) fn validate(catalog: &BTreeMap<String, Model>) -> Result<(), Error> {
     if catalog.is_empty() {
         return Err("catalog is empty".into());
     }
@@ -352,5 +352,12 @@ mod tests {
     #[test]
     fn validate_rejects_empty_catalog() {
         assert!(validate(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn validate_requires_keys_to_match_model_ids() {
+        let model = model("example/model", &[("prompt", "0"), ("completion", "0")]);
+        assert!(validate(&BTreeMap::from([("wrong/key".into(), model.clone())])).is_err());
+        assert!(validate(&BTreeMap::from([(model.id.clone(), model)])).is_ok());
     }
 }
