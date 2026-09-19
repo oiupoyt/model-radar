@@ -154,9 +154,14 @@ struct WatchPatch {
     clear_role: bool,
 }
 
+/// Upper bound on queued alerts per subscription. A channel that can no longer receive
+/// messages (deleted channel, revoked Send Messages permission) keeps every detection
+/// pending so it can retry, which without a bound would grow `state.json` forever.
+const MAX_PENDING: usize = 50;
+
 fn prune_pending(sub: &mut Subscription) {
     let mut seen = BTreeSet::new();
-    sub.pending = sub
+    let mut kept: Vec<_> = sub
         .pending
         .iter()
         .filter(|event| {
@@ -164,6 +169,17 @@ fn prune_pending(sub: &mut Subscription) {
         })
         .cloned()
         .collect();
+    if kept.len() > MAX_PENDING {
+        let dropped = kept.len() - MAX_PENDING;
+        // Keep the newest detections; the oldest queued alerts are the least useful.
+        kept.drain(..dropped);
+        tracing::warn!(
+            channel_id = sub.channel_id,
+            dropped,
+            "Queued alert limit reached; dropped oldest detections"
+        );
+    }
+    sub.pending = kept;
 }
 
 fn patch_subscription(
@@ -549,6 +565,9 @@ fn updated(mut state: State, current: BTreeMap<String, Model>) -> State {
                 .cloned()
                 .collect();
             sub.pending.extend(additions);
+            // Bound the queue again after appending so one poll cannot push it past the
+            // limit that prune_pending enforces.
+            prune_pending(sub);
         }
     }
     state.catalog = current;
@@ -645,6 +664,21 @@ fn support_url() -> Result<Option<String>, Error> {
     Ok(Some(url.to_string()))
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -731,7 +765,7 @@ async fn main() -> Result<(), Error> {
                 if let Some(ctx) = error.ctx() {
                     let _ = reply(ctx, embed("Request failed").description("Check your permissions and arguments, or retry shortly. The operator can check bot logs.")).await;
                 }
-                tracing::warn!("Discord command/framework error");
+                tracing::warn!(%error, "Discord command/framework error");
             }),
             ..Default::default()
         })
@@ -748,8 +782,12 @@ async fn main() -> Result<(), Error> {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
-                    if refresh(&poll_store, &http_client).await.is_err() { tracing::warn!("Catalog refresh failed; preserving previous snapshot"); }
-                    if deliver(&poll_store, &http).await.is_err() { tracing::warn!("Saving delivery progress failed; alerts may retry"); }
+                    if let Err(error) = refresh(&poll_store, &http_client).await {
+                        tracing::warn!(%error, "Catalog refresh failed; preserving previous snapshot");
+                    }
+                    if let Err(error) = deliver(&poll_store, &http).await {
+                        tracing::warn!(%error, "Saving delivery progress failed; alerts may retry");
+                    }
                 }
             });
             tracing::info!(poll_seconds, "Model Radar connected; catalog polling configured");
@@ -761,7 +799,11 @@ async fn main() -> Result<(), Error> {
         .await?;
     tokio::select! {
         result = client.start() => result?,
-        result = tokio::signal::ctrl_c() => { result?; client.shard_manager.shutdown_all().await; }
+        result = shutdown_signal() => {
+            result?;
+            tracing::info!("Shutdown signal received; stopping shards");
+            client.shard_manager.shutdown_all().await;
+        }
     }
     Ok(())
 }
@@ -901,6 +943,66 @@ mod tests {
         assert!(!reset.ping_enabled);
         assert_eq!(reset.role_id, None);
         assert_eq!(reset.pending, sub.pending);
+    }
+
+    #[test]
+    fn pending_queue_is_bounded_and_keeps_newest_detections() {
+        let mut sub = subscription();
+        assert!(!sub.free_only);
+        sub.pending = (0..MAX_PENDING + 10)
+            .map(|index| {
+                let mut event = event(false);
+                event.model.id = format!("model/{index}");
+                event.model.name = format!("Model {index}");
+                event
+            })
+            .collect();
+        prune_pending(&mut sub);
+        assert_eq!(sub.pending.len(), MAX_PENDING);
+        assert_eq!(sub.pending[0].model.id, "model/10");
+        assert_eq!(
+            sub.pending[MAX_PENDING - 1].model.id,
+            format!("model/{}", MAX_PENDING + 9)
+        );
+        let mut small = subscription();
+        small.pending = vec![event(true), event(false)];
+        small.pending[0].kind = "paid_to_free".into();
+        let before = small.pending.clone();
+        prune_pending(&mut small);
+        assert_eq!(small.pending, before);
+    }
+
+    #[test]
+    fn updated_bounds_queued_alerts_for_unreachable_channels() {
+        let mut state = State {
+            initialized: true,
+            ..Default::default()
+        };
+        let mut sub = subscription();
+        sub.pending = (0..MAX_PENDING)
+            .map(|index| {
+                let mut event = event(false);
+                event.model.id = format!("model/{index}");
+                event
+            })
+            .collect();
+        state.subscriptions.insert(1, sub);
+        let template = catalog(false).into_values().next().unwrap();
+        let current: BTreeMap<String, Model> = (0..10)
+            .map(|index| {
+                let mut model = template.clone();
+                model.id = format!("extra/{index}");
+                model.name = model.id.clone();
+                (model.id.clone(), model)
+            })
+            .collect();
+        let state = updated(state, current);
+        assert_eq!(state.subscriptions[&1].pending.len(), MAX_PENDING);
+        assert_eq!(state.subscriptions[&1].pending[0].model.id, "model/10");
+        assert_eq!(
+            state.subscriptions[&1].pending[MAX_PENDING - 1].model.id,
+            "extra/9"
+        );
     }
 
     #[test]
